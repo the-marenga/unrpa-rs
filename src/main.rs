@@ -7,7 +7,6 @@ use std::{
 };
 
 use clap::Parser;
-use indexmap::IndexMap;
 use log::{debug, error, LevelFilter};
 use serde_pickle::DeOptions;
 use thiserror::Error;
@@ -189,8 +188,18 @@ fn extract_archive(
         offset = overwrites.offset;
     }
 
+    let index = parse_index(&mut reader, offset, key);
+
+    Ok(())
+}
+
+fn parse_index<R: BufRead + std::io::Seek>(
+    reader: &mut R,
+    index_offset: u64,
+    key: Option<u64>,
+) -> Result<HashMap<IndexKey, Vec<IndexEntry>>, UnrpaError> {
     reader
-        .seek(SeekFrom::Start(offset))
+        .seek(SeekFrom::Start(index_offset))
         .map_err(UnrpaError::FileRead)?;
 
     let mut index = vec![];
@@ -201,35 +210,62 @@ fn extract_archive(
     let decompressed = zune_inflate::DeflateDecoder::new(&index)
         .decode_zlib()
         .map_err(UnrpaError::InvalidZLIBIndex)?;
-
     drop(index);
 
-    let unpickled: IndexMap<String, Vec<IndexEntry>> =
+    let raw_index: HashMap<IndexKey, Vec<GenericIndexEntry>> =
         serde_pickle::from_slice(&decompressed, DeOptions::new())
             .map_err(UnrpaError::InvalidIndex)?;
+    drop(decompressed);
 
-    println!("{unpickled:#?}");
-    // index: Dict[bytes, IndexEntry] = pickle.loads(
-    //     zlib.decompress(archive.read()), encoding="bytes"
-    // )
-    // if key is not None:
-    //     normal_index = UnRPA.deobfuscate_index(key, index)
-    // else:
-    //     normal_index = UnRPA.normalise_index(index)
+    let mut normalized_index = HashMap::new();
+    for (index_key, index_value) in raw_index {
+        let mut vals = vec![];
+        for val in index_value {
+            let mut value: IndexEntry = val.into();
+            if let Some(key) = key {
+                value.offset ^= key;
+                value.length ^= key;
+            }
+            vals.push(value);
+        }
+        normalized_index.insert(index_key, vals);
+    }
+    Ok(normalized_index)
+}
 
-    // return {
-    //     UnRPA.ensure_str_path(path).replace("/", os.sep): data
-    //     for path, data in normal_index.items()
-    // }
+#[derive(Debug, serde::Deserialize, Hash, PartialEq, Eq)]
+struct IndexKey(PathBuf);
 
-    Ok(())
+#[derive(Debug, serde::Deserialize)]
+struct IndexEntry {
+    offset: u64,
+    length: u64,
+    #[serde(with = "serde_bytes")]
+    start: Vec<u8>,
+}
+
+impl From<GenericIndexEntry> for IndexEntry {
+    fn from(value: GenericIndexEntry) -> Self {
+        match value {
+            GenericIndexEntry::SimpleIndexPart(a, b) => IndexEntry {
+                offset: a,
+                length: b,
+                start: vec![],
+            },
+            GenericIndexEntry::ComplexIndexPart(a, b, vec) => IndexEntry {
+                offset: a,
+                length: b,
+                start: vec,
+            },
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
-enum IndexEntry {
-    SinpleIndexPart(i64, #[serde(with = "serde_bytes")] Vec<u8>),
-    ComplexIndexPart(i64, i64, #[serde(with = "serde_bytes")] Vec<u8>),
+enum GenericIndexEntry {
+    SimpleIndexPart(u64, u64),
+    ComplexIndexPart(u64, u64, #[serde(with = "serde_bytes")] Vec<u8>),
 }
 
 struct HeaderInfo {
