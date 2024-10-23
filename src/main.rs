@@ -136,10 +136,50 @@ fn main() {
 
     env_logger::builder().filter_level(log_level).init();
 
-    if args.display.tree || args.display.list {
+    if args.display.tree {
         todo!();
+    } else if args.display.list {
+        for input_file in &args.files {
+            if let Err(e) = list_archive(
+                input_file,
+                args.advanced.overwrites,
+                args.advanced.force,
+            ) {
+                error!("{e} ({})'", input_file.to_string_lossy());
+                continue;
+            }
+        }
+    } else {
+        extract_archives(args);
+    }
+}
+
+fn list_archive(
+    input_file: &Path,
+    overwrites: Option<ExtractOptions>,
+    overwrite_version: Option<RPAVersion>,
+) -> Result<(), UnrpaError> {
+    let file = File::open(input_file).map_err(UnrpaError::FileRead)?;
+    let mut reader = BufReader::new(file);
+
+    let options = determine_options(
+        input_file,
+        overwrites,
+        overwrite_version,
+        &mut reader,
+    )?;
+
+    let mut index = parse_index(&mut reader, options)?;
+    index.sort_keys();
+    println!("{}:", input_file.to_string_lossy());
+    for k in index.keys() {
+        println!("\t{}", k.0.to_string_lossy())
     }
 
+    Ok(())
+}
+
+fn extract_archives(args: Args) {
     if args.mkdir {
         if let Err(e) = std::fs::create_dir_all(&args.path)
             .map_err(UnrpaError::InvalidOutDir)
@@ -150,7 +190,8 @@ fn main() {
     }
 
     if !args.path.is_dir() {
-        panic!("Could not find output directory");
+        log::error!("Could not find output directory");
+        std::process::exit(1);
     }
 
     for input_file in &args.files {
@@ -168,45 +209,50 @@ fn main() {
     }
 }
 
+fn determine_options(
+    input_path: &Path,
+    overwrites: Option<ExtractOptions>,
+    overwrite_version: Option<RPAVersion>,
+    reader: &mut impl BufRead,
+) -> Result<HeaderInfo, UnrpaError> {
+    let extension = input_path.extension().and_then(|a| a.to_str());
+    let mut header = read_header(reader, extension, overwrite_version)?;
+
+    if let Some(overwrites) = overwrites {
+        header.key = Some(overwrites.key);
+        header.offset = overwrites.offset;
+    }
+    Ok(header)
+}
+
 fn extract_archive(
     input_file: &Path,
     overwrite_version: Option<RPAVersion>,
     overwrites: Option<ExtractOptions>,
     out_path: &Path,
 ) -> Result<(), UnrpaError> {
-    let extension = input_file.extension().and_then(|a| a.to_str());
     let file = File::open(input_file).map_err(UnrpaError::FileRead)?;
     let mut reader = BufReader::new(file);
 
-    let HeaderInfo {
-        mut offset,
-        mut key,
-    } = read_header(&mut reader, extension, overwrite_version)?;
+    let options = determine_options(
+        input_file,
+        overwrites,
+        overwrite_version,
+        &mut reader,
+    )?;
 
-    if let Some(overwrites) = overwrites {
-        key = Some(overwrites.key);
-        offset = overwrites.offset;
-    }
-
-    let index = parse_index(&mut reader, offset, key)?;
+    let index = parse_index(&mut reader, options)?;
     let total_files = index.len();
-
-    // index.sort_by(|_, b, _, d| b.first().cmp(&d.first()));
 
     for (idx, (k, v)) in index.into_iter().enumerate() {
         let out_file = out_path.join(&k.0);
         if let Some(p) = out_file.parent() {
             create_dir_all(p).map_err(UnrpaError::InvalidOutDir)?;
         }
-        let filename = out_file
-            .file_name()
-            .map(|a| a.to_string_lossy())
-            .unwrap_or_default();
-
         info!(
             "[{:04.2}%] {:>3}",
             (idx as f64 / total_files as f64) * 100.0,
-            filename
+            out_file.to_string_lossy()
         );
         extract_file(&out_file, v, &mut reader)?;
     }
@@ -237,11 +283,10 @@ fn extract_file<R: BufRead + std::io::Seek>(
 
 fn parse_index<R: BufRead + std::io::Seek>(
     reader: &mut R,
-    index_offset: u64,
-    key: Option<u64>,
+    options: HeaderInfo,
 ) -> Result<IndexMap<IndexKey, Vec<IndexEntry>>, UnrpaError> {
     reader
-        .seek(SeekFrom::Start(index_offset))
+        .seek(SeekFrom::Start(options.offset))
         .map_err(UnrpaError::FileRead)?;
 
     let mut index = vec![];
@@ -264,7 +309,7 @@ fn parse_index<R: BufRead + std::io::Seek>(
         let mut vals = vec![];
         for val in index_value {
             let mut value: IndexEntry = val.into();
-            if let Some(key) = key {
+            if let Some(key) = options.key {
                 value.offset ^= key;
                 value.length ^= key;
             }
@@ -275,7 +320,7 @@ fn parse_index<R: BufRead + std::io::Seek>(
     Ok(normalized_index)
 }
 
-#[derive(Debug, serde::Deserialize, Hash, PartialEq, Eq)]
+#[derive(Debug, serde::Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct IndexKey(PathBuf);
 
 #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
@@ -284,18 +329,6 @@ struct IndexEntry {
     length: u64,
     #[serde(with = "serde_bytes")]
     start: Vec<u8>,
-}
-
-impl PartialOrd for IndexEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for IndexEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.offset.cmp(&other.offset)
-    }
 }
 
 impl From<GenericIndexEntry> for IndexEntry {
