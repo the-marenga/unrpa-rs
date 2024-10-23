@@ -1,13 +1,13 @@
 use core::str;
 use std::{
-    collections::HashMap,
-    fs::File,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    fs::{create_dir_all, File},
+    io::{self, BufRead, BufReader, BufWriter, Read, SeekFrom},
     path::{Path, PathBuf},
 };
 
 use clap::Parser;
-use log::{debug, error, LevelFilter};
+use indexmap::IndexMap;
+use log::{debug, error, info, LevelFilter};
 use serde_pickle::DeOptions;
 use thiserror::Error;
 
@@ -88,7 +88,7 @@ struct ExtractOptions {
     offset: u64,
 }
 
-#[derive(clap::ValueEnum, Clone, Debug, Copy)]
+#[derive(clap::ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
 enum RPAVersion {
     #[clap(name = "RPA-1.0")]
     RPA1,
@@ -114,6 +114,8 @@ enum UnrpaError {
     FileRead(std::io::Error),
     #[error("Could not create output directory: {0}")]
     InvalidOutDir(std::io::Error),
+    #[error("Could not create output file: {0}")]
+    InvalidOutFile(std::io::Error),
     #[error("Could not determine archive version")]
     UnknownArchive,
     #[error("Could not decompress zlib archive index: {0}")]
@@ -158,6 +160,7 @@ fn main() {
             input_file,
             args.advanced.force,
             args.advanced.overwrites,
+            &args.path,
         ) {
             error!("{e} ({input_str})'");
             continue;
@@ -169,26 +172,65 @@ fn extract_archive(
     input_file: &Path,
     overwrite_version: Option<RPAVersion>,
     overwrites: Option<ExtractOptions>,
+    out_path: &Path,
 ) -> Result<(), UnrpaError> {
     let extension = input_file.extension().and_then(|a| a.to_str());
     let file = File::open(input_file).map_err(UnrpaError::FileRead)?;
     let mut reader = BufReader::new(file);
 
     let HeaderInfo {
-        mut version,
         mut offset,
         mut key,
-    } = read_header(&mut reader, extension)?;
+    } = read_header(&mut reader, extension, overwrite_version)?;
 
-    if let Some(v) = overwrite_version {
-        version = v;
-    }
     if let Some(overwrites) = overwrites {
         key = Some(overwrites.key);
         offset = overwrites.offset;
     }
 
-    let index = parse_index(&mut reader, offset, key);
+    let index = parse_index(&mut reader, offset, key)?;
+    let total_files = index.len();
+
+    // index.sort_by(|_, b, _, d| b.first().cmp(&d.first()));
+
+    for (idx, (k, v)) in index.into_iter().enumerate() {
+        let out_file = out_path.join(&k.0);
+        if let Some(p) = out_file.parent() {
+            create_dir_all(p).map_err(UnrpaError::InvalidOutDir)?;
+        }
+        let filename = out_file
+            .file_name()
+            .map(|a| a.to_string_lossy())
+            .unwrap_or_default();
+
+        info!(
+            "[{:04.2}%] {:>3}",
+            (idx as f64 / total_files as f64) * 100.0,
+            filename
+        );
+        extract_file(&out_file, v, &mut reader)?;
+    }
+
+    debug!("Index contains {total_files} files");
+
+    Ok(())
+}
+
+fn extract_file<R: BufRead + std::io::Seek>(
+    out_file: &Path,
+    idx_entry: Vec<IndexEntry>,
+    archive: &mut R,
+) -> Result<(), UnrpaError> {
+    let output_file =
+        File::create(out_file).map_err(UnrpaError::InvalidOutFile)?;
+    let mut writer = BufWriter::new(output_file);
+    for entry in idx_entry {
+        archive
+            .seek(SeekFrom::Start(entry.offset))
+            .map_err(UnrpaError::FileRead)?;
+        let mut archive = archive.take(entry.length);
+        io::copy(&mut archive, &mut writer).map_err(UnrpaError::FileRead)?;
+    }
 
     Ok(())
 }
@@ -197,7 +239,7 @@ fn parse_index<R: BufRead + std::io::Seek>(
     reader: &mut R,
     index_offset: u64,
     key: Option<u64>,
-) -> Result<HashMap<IndexKey, Vec<IndexEntry>>, UnrpaError> {
+) -> Result<IndexMap<IndexKey, Vec<IndexEntry>>, UnrpaError> {
     reader
         .seek(SeekFrom::Start(index_offset))
         .map_err(UnrpaError::FileRead)?;
@@ -212,12 +254,12 @@ fn parse_index<R: BufRead + std::io::Seek>(
         .map_err(UnrpaError::InvalidZLIBIndex)?;
     drop(index);
 
-    let raw_index: HashMap<IndexKey, Vec<GenericIndexEntry>> =
+    let raw_index: IndexMap<IndexKey, Vec<GenericIndexEntry>> =
         serde_pickle::from_slice(&decompressed, DeOptions::new())
             .map_err(UnrpaError::InvalidIndex)?;
     drop(decompressed);
 
-    let mut normalized_index = HashMap::new();
+    let mut normalized_index = IndexMap::new();
     for (index_key, index_value) in raw_index {
         let mut vals = vec![];
         for val in index_value {
@@ -236,12 +278,24 @@ fn parse_index<R: BufRead + std::io::Seek>(
 #[derive(Debug, serde::Deserialize, Hash, PartialEq, Eq)]
 struct IndexKey(PathBuf);
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
 struct IndexEntry {
     offset: u64,
     length: u64,
     #[serde(with = "serde_bytes")]
     start: Vec<u8>,
+}
+
+impl PartialOrd for IndexEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IndexEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.offset.cmp(&other.offset)
+    }
 }
 
 impl From<GenericIndexEntry> for IndexEntry {
@@ -269,7 +323,6 @@ enum GenericIndexEntry {
 }
 
 struct HeaderInfo {
-    version: RPAVersion,
     offset: u64,
     key: Option<u64>,
 }
@@ -277,10 +330,12 @@ struct HeaderInfo {
 fn read_header(
     reader: &mut impl BufRead,
     extension: Option<&str>,
+    ov_version: Option<RPAVersion>,
 ) -> Result<HeaderInfo, UnrpaError> {
-    if extension == Some("rpi") {
+    if extension == Some("rpi")
+        && ov_version.map_or(true, |a| a == RPAVersion::RPA1)
+    {
         return Ok(HeaderInfo {
-            version: RPAVersion::RPA1,
             key: None,
             offset: 0,
         });
@@ -295,21 +350,24 @@ fn read_header(
         str::from_utf8(&header).unwrap_or("Unknown")
     );
 
-    let version = match &header {
-        b"ALT-1.0" => RPAVersion::ALT1,
-        b"RPA-2.0" => RPAVersion::RPA2,
-        b"RPA-3.0" => RPAVersion::RPA3,
-        b"RPA-3.2" => RPAVersion::RPA32,
-        b"RPA-4.0" => RPAVersion::RPA40,
-        b"ZiX-12A" => RPAVersion::ZiX12A,
-        b"ZiX-12B" => RPAVersion::ZiX12B,
-        _ => {
-            return Err(UnrpaError::UnknownArchive);
-        }
+    let version = match ov_version {
+        Some(version) => version,
+        None => match &header {
+            b"ALT-1.0" => RPAVersion::ALT1,
+            b"RPA-2.0" => RPAVersion::RPA2,
+            b"RPA-3.0" => RPAVersion::RPA3,
+            b"RPA-3.2" => RPAVersion::RPA32,
+            b"RPA-4.0" => RPAVersion::RPA40,
+            b"ZiX-12A" => RPAVersion::ZiX12A,
+            b"ZiX-12B" => RPAVersion::ZiX12B,
+            _ => {
+                return Err(UnrpaError::UnknownArchive);
+            }
+        },
     };
 
     let make_u64 = |str| {
-        u64::from_str_radix(str, 16).map_err(|e| UnrpaError::UnknownArchive)
+        u64::from_str_radix(str, 16).map_err(|_| UnrpaError::UnknownArchive)
     };
 
     let (offset, key) = match version {
@@ -350,9 +408,5 @@ fn read_header(
         debug!("Found key: {key}");
     }
 
-    Ok(HeaderInfo {
-        version,
-        key,
-        offset,
-    })
+    Ok(HeaderInfo { key, offset })
 }
