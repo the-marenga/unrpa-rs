@@ -162,14 +162,14 @@ fn list_archive(
     let file = File::open(input_file).map_err(UnrpaError::FileRead)?;
     let mut reader = BufReader::new(file);
 
-    let options = determine_options(
+    let params = determine_index_params(
         input_file,
         overwrites,
         overwrite_version,
         &mut reader,
     )?;
 
-    let mut index = parse_index(&mut reader, options)?;
+    let mut index = parse_index(&mut reader, params)?;
     index.sort_keys();
     println!("{}:", input_file.to_string_lossy());
     for k in index.keys() {
@@ -209,14 +209,14 @@ fn extract_archives(args: Args) {
     }
 }
 
-fn determine_options(
+fn determine_index_params(
     input_path: &Path,
     overwrites: Option<ExtractOptions>,
     overwrite_version: Option<RPAVersion>,
     reader: &mut impl BufRead,
-) -> Result<HeaderInfo, UnrpaError> {
+) -> Result<IndexParams, UnrpaError> {
     let extension = input_path.extension().and_then(|a| a.to_str());
-    let mut header = read_header(reader, extension, overwrite_version)?;
+    let mut header = read_index_params(reader, extension, overwrite_version)?;
 
     if let Some(overwrites) = overwrites {
         header.key = Some(overwrites.key);
@@ -234,7 +234,7 @@ fn extract_archive(
     let file = File::open(input_file).map_err(UnrpaError::FileRead)?;
     let mut reader = BufReader::new(file);
 
-    let options = determine_options(
+    let options = determine_index_params(
         input_file,
         overwrites,
         overwrite_version,
@@ -272,9 +272,9 @@ fn extract_file<R: BufRead + std::io::Seek>(
     let mut writer = BufWriter::new(output_file);
     for entry in idx_entry {
         archive
-            .seek(SeekFrom::Start(entry.offset))
+            .seek(SeekFrom::Start(entry.0))
             .map_err(UnrpaError::FileRead)?;
-        let mut archive = archive.take(entry.length);
+        let mut archive = archive.take(entry.1);
         io::copy(&mut archive, &mut writer).map_err(UnrpaError::FileRead)?;
     }
 
@@ -283,7 +283,7 @@ fn extract_file<R: BufRead + std::io::Seek>(
 
 fn parse_index<R: BufRead + std::io::Seek>(
     reader: &mut R,
-    options: HeaderInfo,
+    options: IndexParams,
 ) -> Result<IndexMap<IndexKey, Vec<IndexEntry>>, UnrpaError> {
     reader
         .seek(SeekFrom::Start(options.offset))
@@ -299,76 +299,52 @@ fn parse_index<R: BufRead + std::io::Seek>(
         .map_err(UnrpaError::InvalidZLIBIndex)?;
     drop(index);
 
-    let raw_index: IndexMap<IndexKey, Vec<GenericIndexEntry>> =
+    let mut index: IndexMap<IndexKey, Vec<IndexEntry>> =
         serde_pickle::from_slice(&decompressed, DeOptions::new())
             .map_err(UnrpaError::InvalidIndex)?;
     drop(decompressed);
 
-    let mut normalized_index = IndexMap::new();
-    for (index_key, index_value) in raw_index {
-        let mut vals = vec![];
-        for val in index_value {
-            let mut value: IndexEntry = val.into();
+    for index_value in index.values_mut() {
+        for val in index_value.iter_mut() {
             if let Some(key) = options.key {
-                value.offset ^= key;
-                value.length ^= key;
+                val.0 ^= key;
+                val.1 ^= key;
             }
-            vals.push(value);
         }
-        normalized_index.insert(index_key, vals);
     }
-    Ok(normalized_index)
+    Ok(index)
 }
 
 #[derive(Debug, serde::Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct IndexKey(PathBuf);
 
 #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
-struct IndexEntry {
-    offset: u64,
-    length: u64,
+struct IndexEntry(
+    /// offset
+    u64,
+    /// length
+    u64,
+    /// start
     #[serde(with = "serde_bytes")]
-    start: Vec<u8>,
-}
+    #[serde(default)]
+    Vec<u8>,
+);
 
-impl From<GenericIndexEntry> for IndexEntry {
-    fn from(value: GenericIndexEntry) -> Self {
-        match value {
-            GenericIndexEntry::SimpleIndexPart(a, b) => IndexEntry {
-                offset: a,
-                length: b,
-                start: vec![],
-            },
-            GenericIndexEntry::ComplexIndexPart(a, b, vec) => IndexEntry {
-                offset: a,
-                length: b,
-                start: vec,
-            },
-        }
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(untagged)]
-enum GenericIndexEntry {
-    SimpleIndexPart(u64, u64),
-    ComplexIndexPart(u64, u64, #[serde(with = "serde_bytes")] Vec<u8>),
-}
-
-struct HeaderInfo {
+struct IndexParams {
     offset: u64,
     key: Option<u64>,
 }
 
-fn read_header(
+fn read_index_params(
     reader: &mut impl BufRead,
     extension: Option<&str>,
     ov_version: Option<RPAVersion>,
-) -> Result<HeaderInfo, UnrpaError> {
-    if extension == Some("rpi")
-        && ov_version.map_or(true, |a| a == RPAVersion::RPA1)
+) -> Result<IndexParams, UnrpaError> {
+    if (extension == Some("rpi")
+        && ov_version.map_or(true, |a| a == RPAVersion::RPA1))
+        || ov_version.map_or(false, |a| a == RPAVersion::RPA1)
     {
-        return Ok(HeaderInfo {
+        return Ok(IndexParams {
             key: None,
             offset: 0,
         });
@@ -441,5 +417,5 @@ fn read_header(
         debug!("Found key: {key}");
     }
 
-    Ok(HeaderInfo { key, offset })
+    Ok(IndexParams { key, offset })
 }
