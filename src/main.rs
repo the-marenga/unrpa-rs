@@ -6,7 +6,7 @@ use std::{
 
 use clap::Parser;
 use indexmap::IndexMap;
-use log::{debug, error, info, LevelFilter};
+use log::{debug, error, LevelFilter};
 
 /// unrpa is a tool to extract files from Ren'Py archives (.rpa).
 ///
@@ -119,6 +119,8 @@ enum UnrpaError {
     InvalidZLIBIndex(zune_inflate::errors::InflateDecodeErrors),
     #[error("Could not parse archive index: {0}")]
     InvalidIndex(serde_pickle::Error),
+    #[error("ZIX archives are not supported")]
+    ZIXUnsupported,
 }
 
 fn main() {
@@ -135,7 +137,7 @@ fn main() {
 
     for input_file in &args.files {
         let input_str = input_file.to_string_lossy();
-        info!("Opening on file {input_str}");
+        debug!("Opening file {input_str}");
         if let Err(e) = handle_file(&args, input_file) {
             error!("{e} ({input_str})'");
         }
@@ -318,9 +320,7 @@ fn read_index_params(
             b"RPA-4.0" => RPAVersion::RPA40,
             b"ZiX-12A" => RPAVersion::ZiX12A,
             b"ZiX-12B" => RPAVersion::ZiX12B,
-            _ => {
-                return Err(UnrpaError::UnknownArchive);
-            }
+            _ => return Err(UnrpaError::UnknownArchive),
         },
     };
 
@@ -358,8 +358,9 @@ fn read_index_params(
             let offset = make_u64(offset)?;
             (offset, Some(key))
         }
-        RPAVersion::ZiX12A => todo!(),
-        RPAVersion::ZiX12B => todo!(),
+        RPAVersion::ZiX12A | RPAVersion::ZiX12B => {
+            return Err(UnrpaError::ZIXUnsupported)
+        }
     };
     debug!("Found offset: {offset}");
     if let Some(key) = key {
