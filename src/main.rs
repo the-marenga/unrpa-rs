@@ -1,7 +1,7 @@
 use core::str;
 use std::{
     fs::{create_dir_all, File},
-    io::{self, BufRead, BufReader, BufWriter, Read, SeekFrom},
+    io::{self, BufRead, BufReader, Read, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -137,8 +137,9 @@ fn main() {
     env_logger::builder().filter_level(log_level).init();
 
     for input_file in &args.files {
+        let input_str = input_file.to_string_lossy();
+        info!("Opening on file {input_str}");
         if let Err(e) = handle_file(&args, input_file) {
-            let input_str = input_file.to_string_lossy();
             error!("{e} ({input_str})'");
         }
     }
@@ -186,7 +187,7 @@ fn handle_file(args: &Args, input_file: &Path) -> Result<(), UnrpaError> {
             if let Some(p) = out_file.parent() {
                 create_dir_all(p).map_err(UnrpaError::InvalidOutDir)?;
             }
-            info!(
+            debug!(
                 "[{:04.2}%] {:>3}",
                 (idx as f64 / total_files as f64) * 100.0,
                 out_file.to_string_lossy()
@@ -215,26 +216,25 @@ fn determine_index_params(
     Ok(header)
 }
 
-fn extract_file<R: BufRead + std::io::Seek>(
+fn extract_file<R: Read + std::io::Seek>(
     out_file: &Path,
     idx_entry: Vec<IndexEntry>,
     archive: &mut R,
 ) -> Result<(), UnrpaError> {
-    let output_file =
+    let mut output_file =
         File::create(out_file).map_err(UnrpaError::InvalidOutFile)?;
-    let mut writer = BufWriter::new(output_file);
     for entry in idx_entry {
         archive
             .seek(SeekFrom::Start(entry.0))
             .map_err(UnrpaError::FileRead)?;
         let mut archive = archive.take(entry.1);
-        io::copy(&mut archive, &mut writer).map_err(UnrpaError::FileRead)?;
+        io::copy(&mut archive, &mut output_file)
+            .map_err(UnrpaError::FileRead)?;
     }
-
     Ok(())
 }
 
-fn parse_index<R: BufRead + std::io::Seek>(
+fn parse_index<R: Read + std::io::Seek>(
     reader: &mut R,
     options: IndexParams,
 ) -> Result<IndexMap<IndexKey, Vec<IndexEntry>>, UnrpaError> {
