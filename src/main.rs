@@ -1,4 +1,3 @@
-use core::str;
 use std::{
     fs::{create_dir_all, File},
     io::{self, BufRead, BufReader, Read, SeekFrom},
@@ -8,8 +7,6 @@ use std::{
 use clap::Parser;
 use indexmap::IndexMap;
 use log::{debug, error, info, LevelFilter};
-use serde_pickle::DeOptions;
-use thiserror::Error;
 
 /// unrpa is a tool to extract files from Ren'Py archives (.rpa).
 ///
@@ -108,7 +105,7 @@ enum RPAVersion {
     RPA40,
 }
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 enum UnrpaError {
     #[error("Could not read file: {0}")]
     FileRead(std::io::Error),
@@ -166,7 +163,9 @@ fn handle_file(args: &Args, input_file: &Path) -> Result<(), UnrpaError> {
             println!("\t{}", k.0.to_string_lossy())
         }
     } else {
-        index.sort_by_cached_key(|_, v| v.first().map(|a| a.0).unwrap_or(0));
+        index.sort_by_cached_key(|_, v| {
+            v.first().map(|a| a.offset).unwrap_or(0)
+        });
         if args.mkdir {
             if let Err(e) = std::fs::create_dir_all(&args.path)
                 .map_err(UnrpaError::InvalidOutDir)
@@ -225,9 +224,9 @@ fn extract_file<R: Read + std::io::Seek>(
         File::create(out_file).map_err(UnrpaError::InvalidOutFile)?;
     for entry in idx_entry {
         archive
-            .seek(SeekFrom::Start(entry.0))
+            .seek(SeekFrom::Start(entry.offset))
             .map_err(UnrpaError::FileRead)?;
-        let mut archive = archive.take(entry.1);
+        let mut archive = archive.take(entry.length);
         io::copy(&mut archive, &mut output_file)
             .map_err(UnrpaError::FileRead)?;
     }
@@ -253,15 +252,15 @@ fn parse_index<R: Read + std::io::Seek>(
     drop(index);
 
     let mut index: IndexMap<IndexKey, Vec<IndexEntry>> =
-        serde_pickle::from_slice(&decompressed, DeOptions::new())
+        serde_pickle::from_slice(&decompressed, serde_pickle::DeOptions::new())
             .map_err(UnrpaError::InvalidIndex)?;
     drop(decompressed);
 
     for index_value in index.values_mut() {
         for val in index_value.iter_mut() {
             if let Some(key) = options.key {
-                val.0 ^= key;
-                val.1 ^= key;
+                val.offset ^= key;
+                val.length ^= key;
             }
         }
     }
@@ -271,17 +270,14 @@ fn parse_index<R: Read + std::io::Seek>(
 #[derive(Debug, serde::Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct IndexKey(PathBuf);
 
-#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
-struct IndexEntry(
-    /// offset
-    u64,
-    /// length
-    u64,
-    /// start
+#[derive(Debug, serde_tuple::Deserialize_tuple, PartialEq, Eq)]
+struct IndexEntry {
+    offset: u64,
+    length: u64,
     #[serde(with = "serde_bytes")]
     #[serde(default)]
-    Vec<u8>,
-);
+    start: Vec<u8>,
+}
 
 struct IndexParams {
     offset: u64,
@@ -309,7 +305,7 @@ fn read_index_params(
 
     debug!(
         "Found header: {}",
-        str::from_utf8(&header).unwrap_or("Unknown")
+        core::str::from_utf8(&header).unwrap_or("Unknown")
     );
 
     let version = match ov_version {
