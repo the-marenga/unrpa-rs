@@ -136,77 +136,67 @@ fn main() {
 
     env_logger::builder().filter_level(log_level).init();
 
-    if args.display.tree {
-        todo!();
-    } else if args.display.list {
-        for input_file in &args.files {
-            if let Err(e) = list_archive(
-                input_file,
-                args.advanced.overwrites,
-                args.advanced.force,
-            ) {
-                error!("{e} ({})'", input_file.to_string_lossy());
-                continue;
-            }
+    for input_file in &args.files {
+        if let Err(e) = handle_file(&args, input_file) {
+            let input_str = input_file.to_string_lossy();
+            error!("{e} ({input_str})'");
         }
-    } else {
-        extract_archives(args);
     }
 }
 
-fn list_archive(
-    input_file: &Path,
-    overwrites: Option<ExtractOptions>,
-    overwrite_version: Option<RPAVersion>,
-) -> Result<(), UnrpaError> {
+fn handle_file(args: &Args, input_file: &Path) -> Result<(), UnrpaError> {
     let file = File::open(input_file).map_err(UnrpaError::FileRead)?;
     let mut reader = BufReader::new(file);
 
     let params = determine_index_params(
         input_file,
-        overwrites,
-        overwrite_version,
+        args.advanced.overwrites,
+        args.advanced.force,
         &mut reader,
     )?;
-
     let mut index = parse_index(&mut reader, params)?;
-    index.sort_keys();
-    println!("{}:", input_file.to_string_lossy());
-    for k in index.keys() {
-        println!("\t{}", k.0.to_string_lossy())
-    }
 
-    Ok(())
-}
+    if args.display.tree {
+        todo!()
+    } else if args.display.list {
+        index.sort_keys();
+        println!("{}:", input_file.to_string_lossy());
+        for k in index.keys() {
+            println!("\t{}", k.0.to_string_lossy())
+        }
+    } else {
+        index.sort_by_cached_key(|_, v| v.first().map(|a| a.0).unwrap_or(0));
+        if args.mkdir {
+            if let Err(e) = std::fs::create_dir_all(&args.path)
+                .map_err(UnrpaError::InvalidOutDir)
+            {
+                log::error!("{e}");
+                std::process::exit(1);
+            }
+        }
 
-fn extract_archives(args: Args) {
-    if args.mkdir {
-        if let Err(e) = std::fs::create_dir_all(&args.path)
-            .map_err(UnrpaError::InvalidOutDir)
-        {
-            log::error!("{e}");
+        if !args.path.is_dir() {
+            log::error!("Could not find output directory");
             std::process::exit(1);
         }
-    }
+        let total_files = index.len();
 
-    if !args.path.is_dir() {
-        log::error!("Could not find output directory");
-        std::process::exit(1);
-    }
-
-    for input_file in &args.files {
-        let input_str = input_file.to_string_lossy();
-        debug!("Extracting {input_str}");
-        if let Err(e) = extract_archive(
-            input_file,
-            args.advanced.force,
-            args.advanced.overwrites,
-            &args.path,
-        ) {
-            error!("{e} ({input_str})'");
-            continue;
+        for (idx, (k, v)) in index.into_iter().enumerate() {
+            let out_file = args.path.join(&k.0);
+            if let Some(p) = out_file.parent() {
+                create_dir_all(p).map_err(UnrpaError::InvalidOutDir)?;
+            }
+            info!(
+                "[{:04.2}%] {:>3}",
+                (idx as f64 / total_files as f64) * 100.0,
+                out_file.to_string_lossy()
+            );
+            extract_file(&out_file, v, &mut reader)?;
         }
+
+        debug!("Index contains {total_files} files");
     }
+    Ok(())
 }
 
 fn determine_index_params(
@@ -223,43 +213,6 @@ fn determine_index_params(
         header.offset = overwrites.offset;
     }
     Ok(header)
-}
-
-fn extract_archive(
-    input_file: &Path,
-    overwrite_version: Option<RPAVersion>,
-    overwrites: Option<ExtractOptions>,
-    out_path: &Path,
-) -> Result<(), UnrpaError> {
-    let file = File::open(input_file).map_err(UnrpaError::FileRead)?;
-    let mut reader = BufReader::new(file);
-
-    let options = determine_index_params(
-        input_file,
-        overwrites,
-        overwrite_version,
-        &mut reader,
-    )?;
-
-    let index = parse_index(&mut reader, options)?;
-    let total_files = index.len();
-
-    for (idx, (k, v)) in index.into_iter().enumerate() {
-        let out_file = out_path.join(&k.0);
-        if let Some(p) = out_file.parent() {
-            create_dir_all(p).map_err(UnrpaError::InvalidOutDir)?;
-        }
-        info!(
-            "[{:04.2}%] {:>3}",
-            (idx as f64 / total_files as f64) * 100.0,
-            out_file.to_string_lossy()
-        );
-        extract_file(&out_file, v, &mut reader)?;
-    }
-
-    debug!("Index contains {total_files} files");
-
-    Ok(())
 }
 
 fn extract_file<R: BufRead + std::io::Seek>(
