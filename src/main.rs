@@ -1,12 +1,12 @@
 use std::{
-    fs::{create_dir_all, File},
+    fs::{File, create_dir_all, read_dir},
     io::{self, BufRead, BufReader, Read, SeekFrom},
     path::{Path, PathBuf},
 };
 
 use clap::Parser;
 use indexmap::IndexMap;
-use log::{debug, error, LevelFilter};
+use log::{LevelFilter, debug, error};
 
 /// unrpa is a tool to extract files from Ren'Py archives (.rpa).
 ///
@@ -45,7 +45,7 @@ struct Args {
     /// unsupported or damaged archives.
     #[clap(flatten)]
     advanced: ArgsAdvanced,
-    #[clap(num_args = 1.., value_delimiter = ' ', required=true)]
+    #[clap(num_args = 1.., required=true)]
     files: Vec<PathBuf>,
 }
 
@@ -109,6 +109,8 @@ enum RPAVersion {
 enum UnrpaError {
     #[error("Could not read file: {0}")]
     FileRead(std::io::Error),
+    #[error("Could not write output file: {0}")]
+    FileWrite(std::io::Error),
     #[error("Could not create output directory: {0}")]
     InvalidOutDir(std::io::Error),
     #[error("Could not create output file: {0}")]
@@ -144,12 +146,32 @@ fn main() {
     }
 }
 
-fn handle_file(args: &Args, input_file: &Path) -> Result<(), UnrpaError> {
-    let file = File::open(input_file).map_err(UnrpaError::FileRead)?;
+// TODO: Preceed output path by recursive path
+fn handle_file(args: &Args, input_path: &Path) -> Result<(), UnrpaError> {
+    if input_path.is_dir() {
+        for file in read_dir(input_path).map_err(UnrpaError::FileRead)? {
+            let Ok(file) = file else {
+                log::error!("Invalid file in folder: {input_path:?}");
+                continue;
+            };
+            if (file.file_type().is_ok_and(|a| a.is_dir())
+                || file
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|a| a.ends_with(".rpa")))
+                && let Err(e) = handle_file(args, &file.path())
+            {
+                error!("{e} ({input_path:?})'");
+            }
+        }
+        return Ok(());
+    }
+
+    let file = File::open(input_path).map_err(UnrpaError::FileRead)?;
     let mut reader = BufReader::new(file);
 
     let params = determine_index_params(
-        input_file,
+        input_path,
         args.advanced.overwrites,
         args.advanced.force,
         &mut reader,
@@ -160,21 +182,19 @@ fn handle_file(args: &Args, input_file: &Path) -> Result<(), UnrpaError> {
         todo!()
     } else if args.display.list {
         index.sort_keys();
-        println!("{}:", input_file.to_string_lossy());
         for k in index.keys() {
-            println!("\t{}", k.0.to_string_lossy())
+            println!("{}", k.0.to_string_lossy())
         }
     } else {
         index.sort_by_cached_key(|_, v| {
             v.first().map(|a| a.offset).unwrap_or(0)
         });
-        if args.mkdir {
-            if let Err(e) = std::fs::create_dir_all(&args.path)
+        if args.mkdir
+            && let Err(e) = std::fs::create_dir_all(&args.path)
                 .map_err(UnrpaError::InvalidOutDir)
-            {
-                log::error!("{e}");
-                std::process::exit(1);
-            }
+        {
+            log::error!("{e}");
+            std::process::exit(1);
         }
 
         if !args.path.is_dir() {
@@ -229,8 +249,10 @@ fn extract_file<R: Read + std::io::Seek>(
             .seek(SeekFrom::Start(entry.offset))
             .map_err(UnrpaError::FileRead)?;
         let mut archive = archive.take(entry.length);
+        // io::copy is as fast, or fastere than manually wrapping File in a
+        // BufWriter, so I am not going to do that
         io::copy(&mut archive, &mut output_file)
-            .map_err(UnrpaError::FileRead)?;
+            .map_err(UnrpaError::FileWrite)?;
     }
     Ok(())
 }
@@ -292,8 +314,8 @@ fn read_index_params(
     ov_version: Option<RPAVersion>,
 ) -> Result<IndexParams, UnrpaError> {
     if (extension == Some("rpi")
-        && ov_version.map_or(true, |a| a == RPAVersion::RPA1))
-        || ov_version.map_or(false, |a| a == RPAVersion::RPA1)
+        && ov_version.is_none_or(|a| a == RPAVersion::RPA1))
+        || (ov_version == Some(RPAVersion::RPA1))
     {
         return Ok(IndexParams {
             key: None,
@@ -328,16 +350,13 @@ fn read_index_params(
         u64::from_str_radix(str, 16).map_err(|_| UnrpaError::UnknownArchive)
     };
 
+    let mut line = String::new();
+    reader.read_line(&mut line).map_err(UnrpaError::FileRead)?;
+
     let (offset, key) = match version {
         RPAVersion::RPA1 => unreachable!("RPA1 does not check headers"),
-        RPAVersion::RPA2 => {
-            let mut line = String::new();
-            reader.read_line(&mut line).map_err(UnrpaError::FileRead)?;
-            (make_u64(line.trim())?, None)
-        }
+        RPAVersion::RPA2 => (make_u64(line.trim())?, None),
         RPAVersion::RPA3 | RPAVersion::RPA32 | RPAVersion::RPA40 => {
-            let mut line = String::new();
-            reader.read_line(&mut line).map_err(UnrpaError::FileRead)?;
             let (offset, key) = line
                 .trim()
                 .split_once(' ')
@@ -347,8 +366,6 @@ fn read_index_params(
             (offset, Some(key))
         }
         RPAVersion::ALT1 => {
-            let mut line = String::new();
-            reader.read_line(&mut line).map_err(UnrpaError::FileRead)?;
             let (key, offset) = line
                 .trim()
                 .split_once(' ')
@@ -359,7 +376,7 @@ fn read_index_params(
             (offset, Some(key))
         }
         RPAVersion::ZiX12A | RPAVersion::ZiX12B => {
-            return Err(UnrpaError::ZIXUnsupported)
+            return Err(UnrpaError::ZIXUnsupported);
         }
     };
     debug!("Found offset: {offset}");
