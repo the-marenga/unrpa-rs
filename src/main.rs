@@ -6,7 +6,8 @@ use std::{
 
 use clap::Parser;
 use indexmap::IndexMap;
-use log::{LevelFilter, debug, error};
+use log::{debug, error};
+use tracing_subscriber::{FmtSubscriber, filter::LevelFilter};
 
 /// unrpa is a tool to extract files from Ren'Py archives (.rpa).
 ///
@@ -128,14 +129,14 @@ enum UnrpaError {
 fn main() {
     let args = Args::parse();
     let log_level = if args.silent {
-        LevelFilter::Off
+        LevelFilter::OFF
     } else if args.verbose {
-        LevelFilter::Debug
+        LevelFilter::DEBUG
     } else {
-        LevelFilter::Info
+        LevelFilter::INFO
     };
 
-    env_logger::builder().filter_level(log_level).init();
+    FmtSubscriber::builder().with_max_level(log_level).init();
 
     for input_file in &args.files {
         let input_str = input_file.to_string_lossy();
