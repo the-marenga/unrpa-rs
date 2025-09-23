@@ -1,0 +1,79 @@
+on:
+  release:
+    types: [created]
+
+jobs:
+  release:
+    name: release ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows
+          - target: x86_64-pc-windows-gnu
+            archive: zip
+            runner: ubuntu-latest
+          # Linux
+          - target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            runner: ubuntu-latest
+          # macOS
+          - target: x86_64-apple-darwin
+            archive: tar.gz
+            runner: macos-latest
+          - target: aarch64-apple-darwin
+            archive: tar.gz
+            runner: macos-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          source $HOME/.cargo/env
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          if [[ "${{ matrix.target }}" == *"windows-gnu" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y mingw-w64
+          fi
+
+      - name: Build
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare release directory
+        run: |
+          mkdir -p release
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            cp target/${{ matrix.target }}/release/unrpa-rs release/
+          else
+            find target/${{ matrix.target }}/release -maxdepth 1 -type f -executable -exec cp {} release/ \;
+          fi
+      - name: Compress release
+        run: |
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            FILE="unrpa-${{ matrix.target }}.zip"
+            zip -r "$FILE" release/
+          else
+            FILE="unrpa-${{ matrix.target }}.tar.gz"
+            tar -czvf "$FILE" release/
+          fi
+          echo "RELEASE_FILE=$FILE" >> $GITHUB_ENV
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ env.RELEASE_FILE }}
+          asset_name: ${{ env.RELEASE_FILE }}
+          asset_content_type: ${{ matrix.archive == 'zip' && 'application/zip' || 'application/gzip' }}
