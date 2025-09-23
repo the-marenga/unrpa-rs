@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-clap = { version = "4.5.47", features = ["derive"] }
+clap = { version = "4.5.48", features = ["derive"] }
 indexmap = { version = "2.11.4", features = ["serde"] }
 log = "0.4.28"
-serde = { version = "1.0.225", features = ["derive"] }
+serde = { version = "1.0.226", features = ["derive"] }
 serde-pickle = "1.2.0"
 serde_bytes = "0.11.19"
 serde_tuple = "1.1.2"
