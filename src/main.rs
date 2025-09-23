@@ -208,6 +208,7 @@ fn handle_file(args: &Args, input_path: &Path) -> Result<(), UnrpaError> {
         for (idx, (k, v)) in index.into_iter().enumerate() {
             let out_file = args.path.join(&k.0);
             if let Some(p) = out_file.parent() {
+                // TEST
                 create_dir_all(p).map_err(UnrpaError::InvalidOutDir)?;
             }
             debug!(
