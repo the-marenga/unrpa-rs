@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic)]
+
 use std::{
     fs::{File, create_dir_all, read_dir},
     io::{self, BufRead, BufReader, Read, SeekFrom},
@@ -152,17 +154,17 @@ fn handle_file(args: &Args, input_path: &Path) -> Result<(), UnrpaError> {
     if input_path.is_dir() {
         for file in read_dir(input_path).map_err(UnrpaError::FileRead)? {
             let Ok(file) = file else {
-                log::error!("Invalid file in folder: {input_path:?}");
+                log::error!("Invalid file in folder: {}", input_path.display());
                 continue;
             };
             if (file.file_type().is_ok_and(|a| a.is_dir())
                 || file
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|a| a.ends_with(".rpa")))
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("rpa")))
                 && let Err(e) = handle_file(args, &file.path())
             {
-                error!("{e} ({input_path:?})'");
+                error!("{e} ({})'", input_path.display());
             }
         }
         return Ok(());
@@ -184,12 +186,10 @@ fn handle_file(args: &Args, input_path: &Path) -> Result<(), UnrpaError> {
     } else if args.display.list {
         index.sort_keys();
         for k in index.keys() {
-            println!("{}", k.0.to_string_lossy())
+            println!("{}", k.0.display());
         }
     } else {
-        index.sort_by_cached_key(|_, v| {
-            v.first().map(|a| a.offset).unwrap_or(0)
-        });
+        index.sort_by_cached_key(|_, v| v.first().map_or(0, |a| a.offset));
         if args.mkdir
             && let Err(e) = std::fs::create_dir_all(&args.path)
                 .map_err(UnrpaError::InvalidOutDir)
@@ -204,6 +204,7 @@ fn handle_file(args: &Args, input_path: &Path) -> Result<(), UnrpaError> {
         }
         let total_files = index.len();
 
+        #[allow(clippy::cast_precision_loss)]
         for (idx, (k, v)) in index.into_iter().enumerate() {
             let out_file = args.path.join(&k.0);
             if let Some(p) = out_file.parent() {
@@ -304,6 +305,7 @@ struct IndexEntry {
     start: Vec<u8>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
 struct IndexParams {
     offset: u64,
     key: Option<u64>,
@@ -314,15 +316,12 @@ fn read_index_params(
     extension: Option<&str>,
     ov_version: Option<RPAVersion>,
 ) -> Result<IndexParams, UnrpaError> {
-    if (extension == Some("rpi")
-        && ov_version.is_none_or(|a| a == RPAVersion::RPA1))
-        || (ov_version == Some(RPAVersion::RPA1))
+    if let (Some(RPAVersion::RPA1), _) | (None, Some("rpi")) =
+        (ov_version, extension)
     {
-        return Ok(IndexParams {
-            key: None,
-            offset: 0,
-        });
+        return Ok(IndexParams::default());
     }
+
     let mut header = [0; 7];
     reader
         .read_exact(&mut header)
@@ -372,7 +371,7 @@ fn read_index_params(
                 .split_once(' ')
                 .ok_or(UnrpaError::UnknownArchive)?;
 
-            let key = make_u64(key)? ^ 0xDABE8DF0;
+            let key = make_u64(key)? ^ 0xDABE_8DF0;
             let offset = make_u64(offset)?;
             (offset, Some(key))
         }
@@ -385,5 +384,5 @@ fn read_index_params(
         debug!("Found key: {key}");
     }
 
-    Ok(IndexParams { key, offset })
+    Ok(IndexParams { offset, key })
 }
