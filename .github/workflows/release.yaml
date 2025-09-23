@@ -60,11 +60,11 @@ jobs:
       - name: Compress release
         run: |
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            FILE="unrpa-${{ matrix.target }}.zip"
-            zip -r "$FILE" release/
+              FILE="unrpa-${{ matrix.target }}.zip"
+              zip "$FILE" release/unrpa-rs.exe
           else
-            FILE="unrpa-${{ matrix.target }}.tar.gz"
-            tar -czvf "$FILE" release/
+              FILE="unrpa-${{ matrix.target }}.tar.gz"
+              tar -czvf "$FILE" -C release unrpa-rs
           fi
           echo "RELEASE_FILE=$FILE" >> $GITHUB_ENV
 
